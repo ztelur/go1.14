@@ -888,6 +888,9 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 // Allocate an object of size bytes.
 // Small objects are allocated from the per-P cache's free lists.
 // Large objects (> 32 kB) are allocated straight from the heap.
+/**
+行时会将堆上的对象按大小分成微对象、小对象和大对象三类，这三类对象的创建都可能会触发新的垃圾收集循环
+*/
 func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	if gcphase == _GCmarktermination {
 		throw("mallocgc called with gcphase == _GCmarktermination")
@@ -956,6 +959,10 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	c := gomcache()
 	var x unsafe.Pointer
 	noscan := typ == nil || typ.ptrdata == 0
+	/**
+	当前线程的内存管理单元中不存在空闲空间时，创建微对象和小对象需要调用
+	runtime.mcache.nextFree 方法从中心缓存或者页堆中获取新的管理单元，在这时就可能触发垃圾收集；
+	*/
 	if size <= maxSmallSize {
 		if noscan && size < maxTinySize {
 			// Tiny allocator.
@@ -1009,6 +1016,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			span := c.alloc[tinySpanClass]
 			v := nextFreeFast(span)
 			if v == 0 {
+				/**
+				中心缓存或者页堆中获取新的管理单元，在这时就可能触发垃圾收集；
+				*/
 				v, _, shouldhelpgc = c.nextFree(tinySpanClass)
 			}
 			x = unsafe.Pointer(v)
@@ -1040,7 +1050,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				memclrNoHeapPointers(unsafe.Pointer(v), size)
 			}
 		}
-	} else {
+	} else { // 32KB 以上 则一定会设置 shouldhelpgc为true
 		var s *mspan
 		shouldhelpgc = true
 		systemstack(func() {
