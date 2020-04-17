@@ -1498,6 +1498,10 @@ var gcWorkPauseGen uint32 = 1
 // it does transition to mark termination, then all reachable objects
 // have been marked, so the write barrier cannot shade any more
 // objects.
+/**
+当所有处理器的本地任务都完成并且不存在剩余的工作 Goroutine 时，后台并发任务或者辅助标记的用户程序会调用 runtime.gcMarkDone
+通知垃圾收集器。当所有可达对象都被标记后，该函数会将垃圾收集的状态切换至 _GCmarktermination；如果本地队列中仍然存在待处理的任务，当前方法会将所有的任务加入全局队列并等待其他 Goroutine 完成处理：
+*/
 func gcMarkDone() {
 	// Ensure only one thread is running the ragged barrier at a
 	// time.
@@ -1524,6 +1528,9 @@ top:
 		// result in a deadlock as we attempt to preempt a worker that's
 		// trying to preempt us (e.g. for a stack scan).
 		casgstatus(gp, _Grunning, _Gwaiting)
+		/**
+		如果本地队列中仍然存在待处理的任务，当前方法会将所有的任务加入全局队列并等待其他 Goroutine 完成处理：
+		*/
 		forEachP(func(_p_ *p) {
 			// Flush the write barrier buffer, since this may add
 			// work to the gcWork.
@@ -1654,7 +1661,12 @@ top:
 			goto top
 		}
 	}
+	/**
+	如果运行时中不包含全局任务、处理器中也不存在本地任务，那么当前垃圾收集循环中的灰色对象也就都标记成了黑色，我们就可以开始触发垃圾收集的阶段迁移了：
 
+
+	下列函数在最后会关闭混合写屏障、唤醒所有协助垃圾收集的用户程序、恢复用户 Goroutine 的调度并调用 runtime.gcMarkTermination 进入标记终止阶段：
+	*/
 	// Disable assists and background workers. We must do
 	// this before waking blocked assists.
 	atomic.Store(&gcBlackenEnabled, 0)
@@ -1681,6 +1693,13 @@ top:
 	gcMarkTermination(nextTriggerRatio)
 }
 
+/**
+我们省略了撒行数函数中很多数据统计的代码，包括正在使用的内存大小、本轮垃圾收集的暂停时间、CPU 的利用率等数据，
+这些数据能够帮助控制器决定下一轮触发垃圾收集的堆大小，除了数据统计之外，该函数还会调用 runtime.gcSweep 重置清理阶段的相关状态并在需要时阻塞清理所有的内存管理单元；
+_GCmarktermination 状态在垃圾收集中并不会持续太久，它会迅速转换至 _GCoff 并恢复应用程序，到这里垃圾收集的全过程基本上就结束了，用户程序在申请内存时才会惰性回收内存。
+
+
+*/
 func gcMarkTermination(nextTriggerRatio float64) {
 	// World is stopped.
 	// Start marktermination which includes enabling the write barrier.
@@ -1916,9 +1935,18 @@ func gcBgMarkPrepare() {
 	work.nwait = ^uint32(0)
 }
 
+/**
+后台的标记任务执行的函数，该函数的循环中执行了对内存中对象图的扫描和标记
+1 获取当前处理器以及 Goroutine 打包成 parkInfo 类型的结构体并主动陷入休眠等待唤醒；
+2 根据处理器上的 gcMarkWorkerMode 模式决定扫描任务的策略；
+3 所有标记任务都完成后，调用 runtime.gcMarkDone 方法完成标记阶段；
+*/
 func gcBgMarkWorker(_p_ *p) {
 	gp := getg()
-
+	/**
+	运行时在这里创建了一个 parkInfo 结构体，该结构体会预先存储处理器和当前 Goroutine，
+	当我们调用 runtime.gopark 触发休眠时，运行时会在系统栈中安全地建立处理器和后台标记任务的绑定关系
+	*/
 	type parkInfo struct {
 		m      muintptr // Release this m on park.
 		attach puintptr // If non-nil, attach to this p on park.
@@ -1945,6 +1973,9 @@ func gcBgMarkWorker(_p_ *p) {
 		// Go to sleep until woken by gcController.findRunnable.
 		// We can't releasem yet since even the call to gopark
 		// may be preempted.
+		/**
+		触发休眠时，运行时会在系统栈中安全地建立处理器和后台标记任务的绑定关系：
+		*/
 		gopark(func(g *g, parkp unsafe.Pointer) bool {
 			park := (*parkInfo)(parkp)
 
@@ -1977,6 +2008,11 @@ func gcBgMarkWorker(_p_ *p) {
 		// Loop until the P dies and disassociates this
 		// worker (the P may later be reused, in which case
 		// it will get a new worker) or we failed to associate.
+
+		/**
+		通过 runtime.gopark 陷入休眠的 Goroutine 不会进入运行队列，它只会等待垃圾收集控制器或者调度器的直接唤醒；
+		在唤醒后，我们会根据处理器 gcMarkWorkerMode 选择不同的标记执行策略，不同的执行策略都会调用 runtime.gcDrain 扫描工作缓冲区 runtime.gcWork：
+		*/
 		if _p_.gcBgMarkWorker.ptr() != gp {
 			break
 		}
@@ -2031,6 +2067,9 @@ func gcBgMarkWorker(_p_ *p) {
 				}
 				// Go back to draining, this time
 				// without preemption.
+				/**
+				扫描工作缓冲区 runtime.gcWork
+				*/
 				gcDrain(&_p_.gcw, gcDrainFlushBgCredit)
 			case gcMarkWorkerFractionalMode:
 				gcDrain(&_p_.gcw, gcDrainFractional|gcDrainUntilPreempt|gcDrainFlushBgCredit)
@@ -2055,6 +2094,11 @@ func gcBgMarkWorker(_p_ *p) {
 
 		// Was this the last worker and did we run out
 		// of work?
+		/**
+		需要注意的是，gcMarkWorkerDedicatedMode 模式的任务是不能被抢占的，为了减少额外开销，第一次调用 runtime.gcDrain
+		方法时是允许抢占的，但是一旦处理器被抢占，当前 Goroutine会将处理器上的所有可运行的 Goroutine 转移至全局队列中，保证垃圾收集占用的
+		CPU 资源。当所有的后台工作任务都陷入等待并且没有剩余工作时，我们就认为该轮垃圾收集的标记阶段结束了，这时我们会调用 runtime.gcMarkDone 函数：
+		*/
 		incnwait := atomic.Xadd(&work.nwait, +1)
 		if incnwait > work.nproc {
 			println("runtime: p.gcMarkWorkerMode=", _p_.gcMarkWorkerMode,

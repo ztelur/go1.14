@@ -379,6 +379,14 @@ func markrootSpans(gcw *gcWork, shard int) {
 // gp must be the calling user gorountine.
 //
 // This must be called with preemption enabled.
+/**
+每个 Goroutine 持有的 gcAssistBytes 表示当前协程辅助标记的字节数，全局垃圾收集控制器持有的 bgScanCredit
+表示后台协程辅助标记的字节数，当本地 Goroutine 分配了较多的对象时，可以使用公用的信用 bgScanCredit 偿还。我们先来分析 runtime.gcAssistAlloc 函数的实现：
+
+
+该函数会先根据 Goroutine 的 gcAssistBytes 和垃圾收集控制器的配置计算需要完成的标记任务数量，如果全局信用 bgScanCredit
+中有可用的点数，那么就会减去该点数，因为并发执行没有加锁，所以全局信用可能会被更新成负值，然而在长期来看这不是一个比较重要的问题。
+*/
 func gcAssistAlloc(gp *g) {
 	// Don't assist in non-preemptible contexts. These are
 	// generally fragile and won't allow the assist to block.
@@ -438,6 +446,9 @@ retry:
 	}
 
 	// Perform assist work
+	/**
+	如果全局信用不足以覆盖本地的债务，运行时会在系统栈中调用 runtime.gcAssistAlloc1 执行标记任务，该函数会直接调用 runtime.gcDrainN 完成指定数量的标记任务并返回：
+	*/
 	systemstack(func() {
 		gcAssistAlloc1(gp, scanWork)
 		// The user stack may have moved, so this can't touch
@@ -449,7 +460,10 @@ retry:
 	if completed {
 		gcMarkDone()
 	}
-
+	/**
+	如果在完成标记辅助任务后，当前 Goroutine 仍然入不敷出并且 Goroutine 没有被抢占，那么运行时会执行 runtime.gcParkAssist；
+	在该函数中，如果全局信用依然不足，runtime.gcParkAssist 会将当前 Goroutine 陷入休眠、加入全局的辅助标记队列并等待后台标记任务的唤醒。
+	*/
 	if gp.gcAssistBytes < 0 {
 		// We were unable steal enough credit or perform
 		// enough work to pay off the assist debt. We need to
@@ -620,9 +634,14 @@ func gcParkAssist() bool {
 // Write barriers are disallowed because this is used by gcDrain after
 // it has ensured that all work is drained and this must preserve that
 // condition.
+// 用于还债的 runtime.gcFlushBgCredit 实现比较简单，如果辅助队列中不存在等待的 Goroutine，那么当前的信用会直接加到全局信用 bgScanCredit 中：
+// 如果辅助队列不为空，上述函数会根据每个 Goroutine 的债务数量和已完成的工作决定是否唤醒这些陷入休眠的 Goroutine；如果唤醒所有的 Goroutine 后，标记任务量仍然有剩余，这些标记任务都会加入全局信用中。
 //
 //go:nowritebarrierrec
 func gcFlushBgCredit(scanWork int64) {
+	/**
+	不存在，则直接加上去
+	*/
 	if work.assistQueue.q.empty() {
 		// Fast path; there are no blocked assists. There's a
 		// small window here where an assist may add itself to
@@ -662,7 +681,9 @@ func gcFlushBgCredit(scanWork int64) {
 			break
 		}
 	}
-
+	/**
+	还有剩余
+	*/
 	if scanBytes > 0 {
 		// Convert from scan bytes back to work.
 		scanWork = int64(float64(scanBytes) * gcController.assistWorkPerByte)
@@ -964,13 +985,30 @@ const (
 // scan work.
 //
 //go:nowritebarrier
+/**
+用于扫描和标记堆内存中对象的核心方法
+
+处理器上的 runtime.gcWork，这个结构体是垃圾收集器中工作池的抽象，它实现了一个生产者和消费者的模型，我们可以以该结构体为起点从整体理解标记工作
+
+运行时会使用 runtime.gcDrain 函数扫描工作缓冲区中的灰色对象，它会根据传入 gcDrainFlags 的不同选择不同的策略：
+
+内存中对象的扫描和标记过程涉及很多位操作和指针操作，相关代码实现比较复杂，我们在这里就不展开介绍相关的内容了，感兴趣的读者可以将 runtime.gcDrain 作为入口研究三色标记的具体过程。
+*/
 func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	if !writeBarrier.needed {
 		throw("gcDrain phase incorrect")
 	}
 
 	gp := getg().m.curg
+	// gcDrainUntilPreempt — 当 Goroutine 的 preempt 字段被设置成 true 时返回；
 	preemptible := flags&gcDrainUntilPreempt != 0
+	//
+
+	/**
+	gcDrainIdle — 调用 runtime.pollWork 函数，当处理器上包含其他待执行 Goroutine 时返回；
+	gcDrainFractional — 调用 runtime.pollFractionalWorkerExit 函数，当 CPU 的占用率超过 fractionalUtilizationGoal 的 20% 时返回；
+	gcDrainFlushBgCredit — 调用 runtime.gcFlushBgCredit 计算后台完成的标记任务量以减少并发标记期间的辅助垃圾收集的用户程序的工作量；
+	*/
 	flushBgCredit := flags&gcDrainFlushBgCredit != 0
 	idle := flags&gcDrainIdle != 0
 
@@ -988,7 +1026,9 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			check = pollFractionalWorkerExit
 		}
 	}
-
+	/**
+	运行时会使用本地变量中的 check 函数检查当前是否应该退出标记任务并让出该处理器。当我们做完准备工作后，就可以开始扫描全局变量中的根对象了，这也是标记阶段中需要最先被执行的任务：
+	*/
 	// Drain root marking jobs.
 	if work.markrootNext < work.markrootJobs {
 		for !(preemptible && gp.preempt) {
@@ -1002,7 +1042,9 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			}
 		}
 	}
-
+	/**
+	扫描根对象需要使用 runtime.markroot 函数，该函数会扫描缓存、数据段、存放全局变量和静态变量的 BSS 段以及 Goroutine 的栈内存；一旦完成了对根对象的扫描，当前 Goroutine 会开始从本地和全局的工作缓存池中获取待执行的任务：
+	*/
 	// Drain heap marking jobs.
 	for !(preemptible && gp.preempt) {
 		// Try to keep work available on the global queue. We used to
@@ -1029,6 +1071,9 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			// Unable to get work.
 			break
 		}
+		/**
+		扫描对象会使用 runtime.scanobject，该函数会从传入的位置开始扫描，扫描期间会调用 runtime.greyobject 为找到的活跃对象上色。
+		*/
 		scanobject(b, gcw)
 
 		// Flush background scan work credit to the global
@@ -1053,6 +1098,9 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	}
 
 done:
+	/**
+	当本轮的扫描因为外部条件变化而中断时，该函数会通过 runtime.gcFlushBgCredit 记录这次扫描的内存字节数用于减少辅助标记的工作量。
+	*/
 	// Flush remaining scan work credit.
 	if gcw.scanWork > 0 {
 		atomic.Xaddint64(&gcController.scanWork, gcw.scanWork)
@@ -1514,8 +1562,8 @@ func gcDumpObject(label string, obj, off uintptr) {
 // not contain any non-nil pointers.
 //
 // This is nosplit so it can manipulate a gcWork without preemption.
-//
-//go:nowritebarrier
+// 我们在上面提到过 Dijkstra 和 Yuasa 写屏障组成的混合写屏障在开启后，所有新创建的对象都需要被直接涂成黑色，这里的标记过程是由 runtime.gcmarknewobject 完成的：
+//go:nowritebarrier runtime.mallocgc 会在垃圾收集开始后调用该函数，获取对象对应的内存单元以及标记位 runtime.markBits 并调用 runtime.markBits.setMarked 直接将新的对象涂成黑色。
 //go:nosplit
 func gcmarknewobject(obj, size, scanSize uintptr) {
 	if useCheckmark { // The world should be stopped so this should not happen.

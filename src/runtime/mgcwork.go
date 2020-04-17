@@ -59,6 +59,12 @@ func init() {
 // the garbage collector from transitioning to mark termination since
 // gcWork may locally hold GC work buffers. This can be done by
 // disabling preemption (systemstack or acquirem).
+/**
+写屏障、根对象扫描和栈扫描都会向工作池中增加额外的灰色对象等待处理，而对象的扫描过程会将灰色对象标记成黑色，同时也可能发现新的灰色对象，当工作队列中不包含灰色对象时，整个扫描过程就会结束。
+为了减少锁竞争，运行时在每个处理器上会保存独立的待扫描工作，然而这会遇到与调度器一样的问题 — 不同处理器的资源不平均，
+导致部分处理器无事可做，调度器引入了工作窃取来解决这个问题，垃圾收集器也使用了差不多的机制平衡不同处理器上的待处理任务。
+
+*/
 type gcWork struct {
 	// wbuf1 and wbuf2 are the primary and secondary work buffers.
 	//
@@ -78,6 +84,12 @@ type gcWork struct {
 	// next.
 	//
 	// Invariant: Both wbuf1 and wbuf2 are nil or neither are.
+	/**
+	runtime.gcWork 为垃圾收集器提供了生产和消费任务的抽象，该结构体持有了两个重要的工作缓冲区 wbuf1 和 wbuf2，这两个缓冲区分别是主缓冲区和备缓冲区：
+
+	当我们向该结构体中增加或者删除对象时，它总会先操作主缓冲区，一旦主缓冲区空间不足或者没有对象，就会触发主备缓冲区的切换；
+	而当两个缓冲区空间都不足或者都为空时，会从全局的工作缓冲区中插入或者获取对象，该结构体相关方法的实现都非常简单，这里就不展开分析了。
+	*/
 	wbuf1, wbuf2 *workbuf
 
 	// Bytes marked (blackened) on this gcWork. This is aggregated
@@ -350,6 +362,9 @@ func (w *gcWork) dispose() {
 
 // balance moves some work that's cached in this gcWork back on the
 // global queue.
+/**
+runtime.gcWork.balance 方法会将处理器本地一部分工作放回全局队列中，让其他的处理器处理，保证不同处理器负载的平衡。
+*/
 //go:nowritebarrierrec
 func (w *gcWork) balance() {
 	if w.wbuf1 == nil {

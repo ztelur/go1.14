@@ -92,6 +92,22 @@ func bgsweep(c chan int) {
 
 // sweepone sweeps some unswept heap span and returns the number of pages returned
 // to the heap, or ^uintptr(0) if there was nothing to sweep.
+/**
+垃圾收集的清理中包含对象回收器（Reclaimer）和内存单元回收器，这两种回收器使用不同的算法清理堆内存：
+
+对象回收器在内存管理单元中查找并释放未被标记的对象，但是如果 runtime.mspan 中的所有对象都没有被标记，整个单元就会被直接回收，该过程会被 runtime.mcentral.cacheSpan 或者 runtime.sweepone 异步触发；
+内存单元回收器会在内存中查找所有的对象都未被标记的 runtime.mspan，该过程会被 runtime.mheap.reclaim 触发；
+
+
+该函数会在堆内存中查找待清理的内存管理单元：
+
+
+查找内存管理单元时会通过 state 和 sweepgen 两个字段判断当前单元是否需要处理。如果内存单元的 sweepgen 等于 mheap.sweepgen - 2，那么就意味着当前单元需要被清理，如果等于 mheap.sweepgen - 1，那么当前管理单元就正在被清理。
+
+
+所有的回收工作最终都是靠 runtime.mspan.sweep 完成的，该函数会根据并发标记阶段回收内存单元中的垃圾并清除标记以免影响下一轮垃圾收集。
+
+*/
 func sweepone() uintptr {
 	_g_ := getg()
 	sweepRatio := mheap_.sweepPagesPerByte // For debugging

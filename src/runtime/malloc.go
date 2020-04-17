@@ -614,10 +614,16 @@ func mallocinit() {
 // be transitioned to Ready before use.
 //
 // h must be locked.
+/**
+是页堆用来申请虚拟内存的方法，我们会分几部分介绍该方法的实现。首先，该方法会尝试在预保留的区域申请内存
+*/
 func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	n = alignUp(n, heapArenaBytes)
 
 	// First, try the arena pre-reservation.
+	/**
+	述代码会调用线性分配器的 runtime.linearAlloc.alloc 方法在预先保留的内存中申请一块可以使用的空间。如果没有可用的空间，我们会根据页堆的 arenaHints 在目标地址上尝试扩容：
+	*/
 	v = h.arena.alloc(n, heapArenaBytes, &memstats.heap_sys)
 	if v != nil {
 		size = n
@@ -625,6 +631,10 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	}
 
 	// Try to grow the heap at a hint address.
+	// 如果没有可用的空间，我们会根据页堆的 arenaHints 在目标地址上尝试扩容：
+	/**
+	runtime.sysReserve 和 runtime.sysMap 是上述代码的核心部分，它们会从操作系统中申请内存并将内存转换至 Prepared 状态。
+	*/
 	for h.arenaHints != nil {
 		hint := h.arenaHints
 		p := hint.addr
@@ -714,6 +724,9 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	// Transition from Reserved to Prepared.
 	sysMap(v, size, &memstats.heap_sys)
 
+	/**
+	runtime.mheap.sysAlloc 方法在最后会初始化一个新的 runtime.heapArena 结构体来管理刚刚申请的内存空间，该结构体会被加入页堆的二维矩阵中。
+	*/
 mapped:
 	// Create arena metadata.
 	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
@@ -828,6 +841,9 @@ var zerobase uintptr
 
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
+/**
+帮助我们获取空闲的内存空间。runtime.nextFreeFast 会利用内存管理单元中的 allocCache 字段，快速找到该字段中位 1 的位数，我们在上面介绍过 1 表示该位对应的内存空间是空闲
+*/
 func nextFreeFast(s *mspan) gclinkptr {
 	theBit := sys.Ctz64(s.allocCache) // Is there a free object in the allocCache?
 	if theBit < 64 {
@@ -838,6 +854,9 @@ func nextFreeFast(s *mspan) gclinkptr {
 				return 0
 			}
 			s.allocCache >>= uint(theBit + 1)
+			/**
+			找到了空闲的对象后，我们就可以更新内存管理单元的 allocCache、freeindex 等字段并返回该片内存了
+			*/
 			s.freeindex = freeidx
 			s.allocCount++
 			return gclinkptr(result*s.elemsize + s.base())
@@ -855,6 +874,12 @@ func nextFreeFast(s *mspan) gclinkptr {
 //
 // Must run in a non-preemptible context since otherwise the owner of
 // c could change.
+/**
+运行时会通过 runtime.mcache.nextFree 找到新的内存管理单元：
+
+如果我们在线程缓存中没有找到可用的内存管理单元，会通过前面介绍的 runtime.mcache.refill
+使用中心缓存中的内存管理单元替换已经不存在可用对象的结构体，该方法会调用新结构体的 runtime.mspan.nextFreeIndex 获取空闲的内存并返回
+*/
 func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bool) {
 	s = c.alloc[spc]
 	shouldhelpgc = false
@@ -865,6 +890,7 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 			println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
 			throw("s.allocCount != s.nelems && freeIndex == s.nelems")
 		}
+
 		c.refill(spc)
 		shouldhelpgc = true
 		s = c.alloc[spc]
@@ -890,6 +916,10 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 // Large objects (> 32 kB) are allocated straight from the heap.
 /**
 行时会将堆上的对象按大小分成微对象、小对象和大对象三类，这三类对象的创建都可能会触发新的垃圾收集循环
+
+在并发标记阶段期间，当 Goroutine 调用 runtime.mallocgc 分配新的对象时，该函数会检查申请内存的 Goroutine 是否处于入不敷出的状态：
+
+堆上所有的对象都会通过调用 runtime.newobject 函数分配内存，该函数会调用 runtime.mallocgc 分配指定大小的内存空间，这也是用户程序向堆上申请内存空间的必经函数：
 */
 func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	if gcphase == _GCmarktermination {
@@ -926,6 +956,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// assistG is the G to charge for this allocation, or nil if
 	// GC is not currently active.
 	var assistG *g
+	/**
+	为了保证用户程序分配内存的速度不会超出后台任务的标记速度，运行时还引入了标记辅助技术，
+	它遵循一条非常简单并且朴实的原则，分配多少内存就需要完成多少标记任务。每一个 Goroutine 都持有 gcAssistBytes 字段，
+	这个字段存储了当前 Goroutine 辅助标记的对象字节数。在并发标记阶段期间，当 Goroutine 调用 runtime.mallocgc 分配新的对象时，该函数会检查申请内存的 Goroutine 是否处于入不敷出的状态：
+	*/
 	if gcBlackenEnabled != 0 {
 		// Charge the current user G for this allocation.
 		assistG = getg()
@@ -934,8 +969,12 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		}
 		// Charge the allocation against the G. We'll account
 		// for internal fragmentation at the end of mallocgc.
+		// 该函数会检查申请内存的 Goroutine 是否处于入不敷出的状态
 		assistG.gcAssistBytes -= int64(size)
-
+		/**
+		申请内存时调用的 runtime.gcAssistAlloc 和扫描内存时调用的 runtime.gcFlushBgCredit
+		分别负责『借债』和『还债』，通过这套债务管理系统，我们能够保证 Goroutine 在正常运行的同时不会为垃圾收集造成太多的压力，保证在达到堆大小目标时完成标记阶段。
+		*/
 		if assistG.gcAssistBytes < 0 {
 			// This G is in debt. Assist the GC to correct
 			// this before allocating. This must happen
@@ -956,15 +995,33 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	shouldhelpgc := false
 	dataSize := size
+	/**
+	上述代码使用 runtime.gomcache 获取了线程缓存并通过类型判断类型是否为指针类型
+	*/
 	c := gomcache()
 	var x unsafe.Pointer
 	noscan := typ == nil || typ.ptrdata == 0
 	/**
 	当前线程的内存管理单元中不存在空闲空间时，创建微对象和小对象需要调用
 	runtime.mcache.nextFree 方法从中心缓存或者页堆中获取新的管理单元，在这时就可能触发垃圾收集；
+
+	微对象 (0, 16B) — 先使用微型分配器，再依次尝试线程缓存、中心缓存和堆分配内存；
+	小对象 [16B, 32KB] — 依次尝试使用线程缓存、中心缓存和堆分配内存；
+	大对象 (32KB, +∞) — 直接在堆上分配内存；
 	*/
 	if size <= maxSmallSize {
-		if noscan && size < maxTinySize {
+		if noscan && size < maxTinySize { // 微对象分配
+
+			/**
+			运行时将小于 16 字节的对象划分为微对象，它会使用线程缓存上的微分配器提高微对象分配的性能，
+			我们主要使用它来分配较小的字符串以及逃逸的临时变量。微分配器可以将多个较小的内存分配请求合入同一个内存块中，只有当内存块中的所有对象都需要被回收时，整片内存才可能被回收。
+
+
+			微分配器管理的对象不可以是指针类型，管理多个对象的内存块大小 maxTinySize 是可以调整的，在默认情况下，内存块的大小为 16 字节。
+			maxTinySize 的值越大，组合多个对象的可能性就越高，内存浪费也就越严重；maxTinySize 越小，内存浪费就会越少，不过无论如何调整，8 的倍数都是一个很好的选择。
+
+			*/
+
 			// Tiny allocator.
 			//
 			// Tiny allocator combines several tiny allocation requests
@@ -1003,6 +1060,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			} else if size&1 == 0 {
 				off = alignUp(off, 2)
 			}
+			/**
+			线程缓存 runtime.mcache 中的 tiny 字段指向了 maxTinySize 大小的块，如果当前块中还包含大小合适的空闲内存，运行时会通过基地址和偏移量获取并返回这块内存：
+			*/
 			if off+size <= maxTinySize && c.tiny != 0 {
 				// The object fits into existing tiny block.
 				x = unsafe.Pointer(c.tiny + off)
@@ -1012,12 +1072,18 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				releasem(mp)
 				return x
 			}
+
+			/**
+			当内存块中不包含空闲的内存时，下面的这段代码会从先线程缓存找到跨度类对应的内存管理单元 runtime.mspan，
+			调用 runtime.nextFreeFast 获取空闲的内存；当不存在空闲内存时，我们会调用 runtime.mcache.nextFree 从中心缓存或者页堆中获取可分配的内存块：
+			*/
 			// Allocate a new maxTinySize block.
 			span := c.alloc[tinySpanClass]
 			v := nextFreeFast(span)
 			if v == 0 {
 				/**
 				中心缓存或者页堆中获取新的管理单元，在这时就可能触发垃圾收集；
+				调用 runtime.mcache.nextFree 从中心缓存或者页堆中获取可分配的内存块：
 				*/
 				v, _, shouldhelpgc = c.nextFree(tinySpanClass)
 			}
@@ -1031,7 +1097,18 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				c.tinyoffset = size
 			}
 			size = maxTinySize
-		} else {
+		} else { // 小对象分配
+			/**
+			小对象是指大小为 16 字节到 32,768 字节的对象以及所有小于 16 字节的指针类型的对象
+
+			小对象的分配可以被分成以下的三个步骤：
+
+			确定分配对象的大小以及跨度类 runtime.spanClass；
+			从线程缓存、中心缓存或者堆中获取内存管理单元并从内存管理单元找到空闲的内存空间；
+			调用 runtime.memclrNoHeapPointers 清空空闲内存中的所有数据；
+
+			确定待分配的对象大小以及跨度类需要使用预先计算好的 size_to_class8、size_to_class128 以及 class_to_size 字典，这些字典能够帮助我们快速获取对应的值并构建 runtime.spanClass：
+			*/
 			var sizeclass uint8
 			if size <= smallSizeMax-8 {
 				sizeclass = size_to_class8[(size+smallSizeDiv-1)/smallSizeDiv]
@@ -1050,7 +1127,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				memclrNoHeapPointers(unsafe.Pointer(v), size)
 			}
 		}
-	} else { // 32KB 以上 则一定会设置 shouldhelpgc为true
+	} else { // 32KB 以上 则一定会设置 shouldhelpgc为true  // 大对象分配
+		/**
+		运行时对于大于 32KB 的大对象会单独处理，我们不会从线程缓存或者中心缓存中获取内存管理单元，
+		而是直接在系统的栈中调用 runtime.largeAlloc 函数分配大片的内存
+		*/
 		var s *mspan
 		shouldhelpgc = true
 		systemstack(func() {
@@ -1100,6 +1181,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// This may be racing with GC so do it atomically if there can be
 	// a race marking the bit.
 	if gcphase != _GCoff {
+		// 所有新创建的对象都需要被直接涂成黑色
 		gcmarknewobject(uintptr(x), size, scanSize)
 	}
 
@@ -1143,6 +1225,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	return x
 }
 
+/**
+函数会计算分配该对象所需要的页数，它会按照 8KB 的倍数为对象在堆上申请内存
+*/
 func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 	// print("largeAlloc size=", size, "\n")
 
@@ -1158,7 +1243,9 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 	// necessary. mHeap_Alloc will also sweep npages, so this only
 	// pays the debt down to npage pages.
 	deductSweepCredit(npages*_PageSize, npages)
-
+	/**
+	申请内存时会创建一个跨度类为 0 的 runtime.spanClass 并调用 runtime.mheap.alloc 分配一个管理对应内存的管理单元。
+	*/
 	s := mheap_.alloc(npages, makeSpanClass(0, noscan), needzero)
 	if s == nil {
 		throw("out of memory")
@@ -1171,6 +1258,9 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 // implementation of new builtin
 // compiler (both frontend and SSA backend) knows the signature
 // of this function
+/**
+堆上所有的对象都会通过调用 runtime.newobject 函数分配内存，该函数会调用 runtime.mallocgc 分配指定大小的内存空间，这也是用户程序向堆上申请内存空间的必经函数：
+*/
 func newobject(typ *_type) unsafe.Pointer {
 	return mallocgc(typ.size, typ, true)
 }

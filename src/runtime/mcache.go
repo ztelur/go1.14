@@ -16,6 +16,12 @@ import (
 // must be specially handled.
 //
 //go:notinheap
+/**
+runtime.mcache 是 Go 语言中的线程缓存，它会与线程上的处理器一一绑定，
+主要用来缓存用户程序申请的微小对象。每一个线程缓存都持有 67 * 2 个 runtime.mspan，这些内存管理单元都存储在结构体的 alloc 字段中：
+
+线程缓存在刚刚被初始化时是不包含 runtime.mspan 的，只有当用户程序申请内存时才会从上一级组件获取新的 runtime.mspan 满足内存分配的需求。
+*/
 type mcache struct {
 	// The following members are accessed on every malloc,
 	// so they are grouped here for better caching.
@@ -31,13 +37,17 @@ type mcache struct {
 	// tiny is a heap pointer. Since mcache is in non-GC'd memory,
 	// we handle it by clearing it in releaseAll during mark
 	// termination.
+	/**
+	线程缓存中还包含几个用于分配微对象的字段，下面的这三个字段组成了微对象分配器，专门为 16 字节以下的对象申请和管理内存：
+	微分配器只会用于分配非指针类型的内存，上述三个字段中 tiny 会指向堆中的一篇内存，tinyOffset 是下一个空闲内存所在的偏移量，最后的 local_tinyallocs 会记录内存分配器中分配的对象个数。
+	*/
 	tiny             uintptr
 	tinyoffset       uintptr
 	local_tinyallocs uintptr // number of tiny allocs not counted in other stats
 
 	// The rest is not accessed on every malloc.
 
-	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass
+	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass // 内存管理单元
 
 	stackcache [_NumStackOrders]stackfreelist
 
@@ -82,6 +92,10 @@ type stackfreelist struct {
 // dummy mspan that contains no free objects.
 var emptymspan mspan
 
+/**
+运行时在初始化处理器时会调用 runtime.allocmcache 初始化线程缓存，
+该函数会在系统栈中使用 runtime.mheap 中的线程缓存分配器初始化新的 runtime.mcache 结构体：
+*/
 func allocmcache() *mcache {
 	var c *mcache
 	systemstack(func() {
@@ -91,6 +105,9 @@ func allocmcache() *mcache {
 		unlock(&mheap_.lock)
 	})
 	for i := range c.alloc {
+		/**
+		初始化后的 runtime.mcache 中的所有 runtime.mspan 都是空的占位符 emptymspan。
+		*/
 		c.alloc[i] = &emptymspan
 	}
 	c.next_sample = nextSample()
@@ -119,6 +136,9 @@ func freemcache(c *mcache) {
 //
 // Must run in a non-preemptible context since otherwise the owner of
 // c could change.
+/**
+线程缓存获取一个指定跨度类的内存管理单元，被替换的单元不能包含空闲的内存空间，而获取的单元中需要至少包含一个空闲对象用于分配内存
+*/
 func (c *mcache) refill(spc spanClass) {
 	// Return the current cached span to the central lists.
 	s := c.alloc[spc]
@@ -135,6 +155,9 @@ func (c *mcache) refill(spc spanClass) {
 	}
 
 	// Get a new cached span from the central lists.
+	/**
+	该函数会从中心缓存中申请新的 runtime.mspan 存储到线程缓存中，这也是向线程缓存中插入内存管理单元的唯一方法
+	*/
 	s = mheap_.central[spc].mcentral.cacheSpan()
 	if s == nil {
 		throw("out of memory")
